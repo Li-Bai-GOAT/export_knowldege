@@ -14,8 +14,9 @@
 2. 进入知识库管理列表页；
 3. 搜索一个知识库名称并进入详情页；
 4. 从详情 URL 获取 knowledgeId；
-5. 调用 queryKnowledgeProcProgressList 获取 knowledgeProcProgressId；
-6. 复用 export_knowledge.py 的接口逻辑，按医院/知识库/接口文件名导出 xlsx。
+5. 点击详情页“编辑”只读取向量模型，不提交任何修改；
+6. 仅当向量模型为 text-embedding-v3 时，调用接口获取 knowledgeProcProgressId；
+7. 复用 export_knowledge.py 的接口逻辑，按医院/知识库/接口文件名导出 xlsx。
 
 账号、密码和医院名称从同目录 config.json 读取；也支持命令行参数和环境变量覆盖。
 
@@ -51,6 +52,9 @@ PASSWORD_PLACEHOLDER = "请输入登录密码"
 SEARCH_PLACEHOLDER = "输入知识库名称进行搜索"
 LOGIN_BUTTON_NAME = "登 录"
 DEFAULT_KNOWLEDGE_NAME = "医生信息知识库"
+TARGET_VECTOR_MODEL = "text-embedding-v3"
+VECTOR_MODEL_SELECTOR = ".hr-form-item__aiModelId input.hr-input__inner"
+IMPORT_SUCCESS_STATUS = "导入成功"
 PROGRESS_URL = "https://aicloud.eheren.com/ai-manager/knowledge/queryKnowledgeProcProgressList"
 PROGRESS_PAGE_SIZE = 10
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -66,6 +70,10 @@ DEFAULT_KNOWLEDGE_NAMES = (
 
 class KnowledgeNotFound(RuntimeError):
     """搜索结果中不存在指定知识库时使用的可恢复异常。"""
+
+
+class VectorModelUnavailable(RuntimeError):
+    """无法在只读编辑表单中确认向量模型时使用的异常。"""
 
 
 def fail(message: str) -> NoReturn:
@@ -228,6 +236,33 @@ def search_knowledge(page: Page, knowledge_name: str) -> tuple[int, str]:
     return matched_count, knowledge_id
 
 
+def read_vector_model(page: Page) -> str:
+    """打开编辑表单只读取向量模型；不点击确定、不提交任何修改。"""
+    edit_button = page.get_by_text("编辑", exact=True)
+    try:
+        edit_button.first.wait_for(state="visible", timeout=20_000)
+    except PlaywrightTimeoutError:
+        raise VectorModelUnavailable(
+            f"详情页未找到“编辑”按钮，当前地址: {page.url}"
+        ) from None
+
+    edit_button.first.click()
+    model_input = page.locator(VECTOR_MODEL_SELECTOR).first
+    try:
+        model_input.wait_for(state="visible", timeout=20_000)
+    except PlaywrightTimeoutError:
+        raise VectorModelUnavailable(
+            f"点击“编辑”后未找到向量模型字段，当前地址: {page.url}"
+        ) from None
+
+    vector_model = model_input.input_value().strip()
+    if not vector_model:
+        raise VectorModelUnavailable(
+            f"向量模型字段为空，无法安全判断是否下载，当前地址: {page.url}"
+        )
+    return vector_model
+
+
 PROGRESS_ID_KEYS = (
     "knowledgeProcProgressId",
     "knowledgeProcProgressID",
@@ -276,7 +311,30 @@ def normalise_progress_records(payload: Any) -> list[dict[str, str | None]]:
                 "knowledgeProcProgressId": progress_id,
                 "fileId": first_value(raw, FILE_ID_KEYS),
                 "fileName": first_value(raw, FILE_NAME_KEYS),
-                "processStatus": first_value(raw, ("processStatus", "process_status", "status")),
+                "processStatus": first_value(
+                    raw,
+                    (
+                        "procStatusStr",
+                        "processStatusStr",
+                        "process_status_str",
+                        "statusStr",
+                        "status_str",
+                        "processStatus",
+                        "process_status",
+                        "status",
+                    ),
+                ),
+                "processStatusCode": first_value(
+                    raw,
+                    (
+                        "procStatus",
+                        "proc_status",
+                        "processStatusCode",
+                        "process_status_code",
+                        "statusCode",
+                        "status_code",
+                    ),
+                ),
             }
         )
     return records
@@ -434,7 +492,7 @@ def main() -> int:
         try:
             login(page, username, password)
             total_exported = 0
-            summary: list[tuple[str, int, int]] = []
+            summary: list[tuple[str, str, int, int, int]] = []
 
             for knowledge_name in knowledge_names:
                 print(f"开始处理知识库: {knowledge_name}")
@@ -442,8 +500,23 @@ def main() -> int:
                     matched_count, knowledge_id = search_knowledge(page, knowledge_name)
                 except KnowledgeNotFound as exc:
                     print(f"跳过知识库: {exc}")
-                    summary.append((knowledge_name, 0, 0))
+                    summary.append((knowledge_name, "未找到", 0, 0, 0))
                     continue
+
+                try:
+                    vector_model = read_vector_model(page)
+                except VectorModelUnavailable as exc:
+                    fail(f"无法确认知识库“{knowledge_name}”的向量模型: {exc}")
+
+                print(f"向量模型: {vector_model}")
+                if vector_model.casefold() != TARGET_VECTOR_MODEL.casefold():
+                    print(
+                        f"跳过知识库: 向量模型为 {vector_model}，"
+                        f"仅 {TARGET_VECTOR_MODEL} 允许下载"
+                    )
+                    summary.append((knowledge_name, "向量模型不匹配，已跳过", 0, 0, 0))
+                    continue
+                print(f"向量模型符合条件，继续下载: {TARGET_VECTOR_MODEL}")
 
                 token = token_holder.get("value")
                 if not token:
@@ -453,8 +526,21 @@ def main() -> int:
                     progress_records = fetch_progress_records(knowledge_id, token)
                 except requests.RequestException as exc:
                     print(f"跳过知识库: 获取文件进度失败 ({exc})")
-                    summary.append((knowledge_name, 0, 0))
+                    summary.append((knowledge_name, "获取文件进度失败", 0, 0, 0))
                     continue
+
+                successful_records: list[dict[str, str | None]] = []
+                for record in progress_records:
+                    process_status = (record.get("processStatus") or "").strip()
+                    if process_status == IMPORT_SUCCESS_STATUS:
+                        successful_records.append(record)
+                    else:
+                        print(
+                            f"跳过未导入成功文件: "
+                            f"progressId={record.get('knowledgeProcProgressId') or '-'} "
+                            f"| fileName={record.get('fileName') or '-'} "
+                            f"| 状态={process_status or '未知'}"
+                        )
 
                 print("进入详情页并获取文件进度 ID 成功")
                 print(f"详情页: {page.url}")
@@ -462,10 +548,11 @@ def main() -> int:
                 print(f"匹配到的同名文本数量: {matched_count}")
                 print(f"knowledgeId: {knowledge_id}")
                 print(f"文件进度记录数: {len(progress_records)}")
+                print(f"导入成功记录数: {len(successful_records)}")
 
                 exported_for_knowledge = 0
                 used_names: set[str] = set()
-                for record in progress_records:
+                for record in successful_records:
                     progress_id = record["knowledgeProcProgressId"]
                     if not progress_id:
                         continue
@@ -499,11 +586,23 @@ def main() -> int:
                     else:
                         print(f"跳过空文件: progressId={progress_id}")
 
-                summary.append((knowledge_name, len(progress_records), exported_for_knowledge))
+                summary.append(
+                    (
+                        knowledge_name,
+                        "完成",
+                        len(progress_records),
+                        len(successful_records),
+                        exported_for_knowledge,
+                    )
+                )
 
             print("\n本次运行汇总:")
-            for knowledge_name, progress_count, exported_count in summary:
-                print(f"- {knowledge_name}: 进度记录 {progress_count} 条，成功导出 {exported_count} 个文件")
+            for knowledge_name, status, progress_count, successful_count, exported_count in summary:
+                print(
+                    f"- {knowledge_name}: {status}；"
+                    f"文件记录 {progress_count} 条，导入成功 {successful_count} 条，"
+                    f"成功导出 {exported_count} 个文件"
+                )
             if total_exported == 0:
                 fail("四个知识库均没有导出任何数据")
             return 0
