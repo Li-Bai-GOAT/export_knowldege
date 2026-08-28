@@ -1,0 +1,28 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local credentials and machine-specific configuration
+config.json
+
+# Generated exports and runtime artifacts
+output/
+*.log
+
+# Source/reference documents are binary data, not script source
+*.xlsx
+*.xls
+*.pdf
+
+# Browser automation artifacts
+playwright-report/
+test-results/
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

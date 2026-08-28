@@ -1,0 +1,12 @@
+{
+  "hospitalName": "demo",
+  "username": "your-username",
+  "password": "your-password",
+  "outputRoot": "./output",
+  "knowledgeNames": [
+    "医生信息知识库",
+    "科室信息知识库",
+    "医院信息知识库",
+    "医院地址知识库"
+  ]
+}
