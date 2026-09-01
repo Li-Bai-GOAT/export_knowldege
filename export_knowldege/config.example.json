@@ -3,6 +3,8 @@
   "username": "your-username",
   "password": "your-password",
   "outputRoot": "./output",
+  "createBgeKnowledgeBases": false,
+  "uploadBgeKnowledgeBases": false,
   "knowledgeNames": [
     "医生信息知识库",
     "科室信息知识库",

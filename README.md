@@ -31,6 +31,8 @@ export_knowldege/
    ├─ config.json                 # 本地真实配置，不提交 Git
    ├─ knowledge_query.py          # 自动登录和批量导出
    ├─ export_knowledge.py         # 根据 ID 和 Token 直接导出
+   ├─ runtime_logging.py          # 统一运行日志配置
+   ├─ logs/                       # 自动脚本默认日志目录
    └─ output/                     # 导出结果，不提交 Git
 ```
 
@@ -73,6 +75,8 @@ Copy-Item .\config.example.json .\config.json
   "username": "登录账号",
   "password": "登录密码",
   "outputRoot": "./output",
+  "createBgeKnowledgeBases": false,
+  "uploadBgeKnowledgeBases": false,
   "knowledgeNames": [
     "医生信息知识库",
     "科室信息知识库",
@@ -102,7 +106,8 @@ python .\knowledge_query.py
 5. 查询知识库文件的进度 ID。
 6. 检查每条文件记录的导入状态，仅保留状态为 `导入成功` 的文件。
 7. 将符合条件的文件对应的知识条目导出为 Excel。
-8. 在终端输出每个知识库的文件记录数、导入成功数和实际导出数。
+8. 如果显式开启 `_bge` 创建，则在导出后按计划创建并复核新知识库。
+9. 在终端输出每个知识库的文件记录数、导入成功数和实际导出数。
 
 自动导出的筛选条件如下：
 
@@ -112,6 +117,68 @@ python .\knowledge_query.py
 - 对应文件必须能拉取到知识条目；空文件不会生成 Excel。
 
 不符合条件的知识库或文件不会下载，跳过原因会直接显示在终端中。
+
+### 创建 `_bge` 知识库
+
+默认不会创建新知识库，也不会点击创建表单的“确认”按钮。需要实际创建时，在确认账号有权限、目标编码不存在后，使用：
+
+```powershell
+python .\knowledge_query.py --create-bge
+```
+
+也可以在 `config.json` 中设置：
+
+```json
+"createBgeKnowledgeBases": true
+```
+
+命令行参数优先于配置文件。每个源知识库只有同时满足以下条件才会创建：
+
+- 源编辑页向量模型为 `text-embedding-v3`；
+- 至少存在一个文件状态为 `导入成功`；
+- 至少成功导出一个文件。
+
+创建入口使用知识库列表页右上角 UI。新库复制源编辑页字段，仅将编码改为 `<原编码>_bge`，向量模型改为 `bge-m3`；创建阶段不上传文件。若目标编码已存在则跳过，不覆盖或修改已有知识库。创建后脚本会重新搜索目标库并复核字段，结果写入源知识库的 `_metadata\knowledge_snapshot.json`。源编辑页只读取并点击“取消”关闭，不会点击“确定”。
+
+### 上传 Excel 到 `_bge` 知识库
+
+默认不会选择本地文件，也不会调用上传接口。确认目标库和文件清单后，使用：
+
+```powershell
+python .\knowledge_query.py --upload-bge
+```
+
+也可以在 `config.json` 中设置：
+
+```json
+"uploadBgeKnowledgeBases": true
+```
+
+上传开关与创建开关相互独立。上传阶段只使用已经存在并通过只读校验的 `_bge` 知识库，不会因为目标库不存在而自动创建。脚本会扫描：
+
+```text
+output/<医院名称>/<知识库名称>/*.xlsx
+```
+
+每个 Excel 单独上传，目标库中已存在同名文件会跳过；接口没有返回进度 ID 时，会通过上传前后文件列表对账，无法唯一关联时记录 `uploaded_untracked`，不会盲目重传。全部上传请求完成后，脚本按 2 秒、5 秒、15 秒递增间隔轮询文件状态，单个文件最多等待 5 分钟；最终状态会记录为 `import_success`、`import_failed`、`timeout`、`skipped_existing`、`upload_rejected` 或 `uploaded_untracked`。结果写入对应源知识库的 `_metadata\knowledge_snapshot.json` 的 `bgeUpload` 字段。
+
+`--upload-bge` 会向第三方线上系统传输本地 Excel。正式运行前请先确认目标知识库和本地文件清单；默认配置保持关闭。
+
+### 运行日志
+
+两个脚本都会同时把运行信息输出到终端和日志文件。每次运行会生成一个带时间戳的 UTF-8 日志文件。
+
+自动批量导出的默认日志目录是：C:\Users\ASUS\Desktop\export_knowldege\logs。
+
+手动导出的默认日志目录是：C:\Users\ASUS\Desktop\export_knowldege\export_knowldege\output\logs。
+
+也可以通过 --log-dir 指定日志目录，例如：
+
+    python .\knowledge_query.py --log-dir "D:\logs\knowledge"
+
+    python .\export_knowledge.py --knowledgeId "知识库ID" --knowledgeProcProgressId "进度ID" --token "登录Token" --log-dir "D:\logs\knowledge"
+
+日志会记录完整链路的阶段进度，包括登录、知识库搜索、编辑配置采集、详情和文件进度读取、导出、`_bge` 创建与复核、逐文件上传、上传结果对账、状态轮询、快照写入、跳过原因、接口错误和最终汇总；账号、密码和 token 不会主动写入日志。
 
 只导出一个知识库：
 
@@ -225,7 +292,7 @@ python -m pip show playwright
 
 ### 知识库被跳过
 
-自动脚本只导出向量模型为 `text-embedding-v3` 的知识库。其他模型会被跳过；如果无法读取向量模型，脚本会安全停止并输出错误，避免错误下载。
+自动脚本只导出向量模型为 `text-embedding-v3` 的知识库。其他模型会被跳过；如果无法读取编辑页配置，脚本会跳过当前知识库，不使用默认值代替。
 
 ### 文件被跳过
 

@@ -9,6 +9,7 @@ config.json
 
 # Generated exports and runtime artifacts
 output/
+logs/
 *.log
 
 # Source/reference documents are binary data, not script source
@@ -25,4 +26,3 @@ test-results/
 .vscode/
 .DS_Store
 Thumbs.db
-
