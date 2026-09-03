@@ -1496,14 +1496,35 @@ def _click_visible_exact(page: Page, text: str) -> None:
     raise KnowledgeCreationUnavailable(f"下拉选项不存在或不可见: {text}")
 
 
-def _select_drawer_option(drawer: Any, page: Page, class_name: str, label: str, value: str) -> None:
+def _select_drawer_option(
+    drawer: Any,
+    page: Page,
+    class_name: str,
+    label: str,
+    value: str,
+    fallback_value: str | None = None,
+) -> str:
     field = _drawer_field(drawer, class_name, label)
     control = field.locator('input:not([type="radio"]):not([type="checkbox"])').first
     if control.count() > 0:
         control.click()
     else:
         field.click()
-    _click_visible_exact(page, value)
+    selected_value = value
+    try:
+        _click_visible_exact(page, value)
+    except KnowledgeCreationUnavailable as exc:
+        if not fallback_value:
+            raise
+        logger.warning(
+            "创建表单下拉选项不可用，使用兜底选项: field=%s, requested=%s, fallback=%s, reason=%s",
+            label,
+            value or "未设置",
+            fallback_value,
+            exc,
+        )
+        _click_visible_exact(page, fallback_value)
+        selected_value = fallback_value
     actual_values: set[str] = set()
     try:
         if control.count() > 0:
@@ -1514,7 +1535,7 @@ def _select_drawer_option(drawer: Any, page: Page, class_name: str, label: str, 
         field_text = _compact_text(field.inner_text())
     except Exception:
         field_text = ""
-    target = _compact_text(value)
+    target = _compact_text(selected_value)
     if field_text:
         actual_values.add(field_text)
     for selected in field.locator(
@@ -1529,8 +1550,9 @@ def _select_drawer_option(drawer: Any, page: Page, class_name: str, label: str, 
             actual_values.add(selected_text)
     if not any(target == actual or target in actual for actual in actual_values):
         raise KnowledgeCreationUnavailable(
-            f"创建表单字段选择后校验失败: {label}，期望={value}，实际={' / '.join(actual_values) or '未知'}"
+            f"创建表单字段选择后校验失败: {label}，期望={selected_value}，实际={' / '.join(actual_values) or '未知'}"
         )
+    return selected_value
 
 
 def _set_radio_option(drawer: Any, label: str, option: dict[str, Any]) -> None:
@@ -1754,6 +1776,7 @@ def find_knowledge_with_code(page: Page, knowledge_name: str, target_code: str) 
 def verify_created_knowledge(
     page: Page,
     expected_config: dict[str, Any],
+    actual_knowledge_class: str | None = None,
 ) -> dict[str, Any]:
     logger.info("开始复核新建知识库: name=%s, code=%s", expected_config.get("name") or "-", expected_config.get("code") or "-")
     existing = find_knowledge_with_code(
@@ -1766,11 +1789,28 @@ def verify_created_knowledge(
         raise KnowledgeCreationUnavailable(
             f"创建后重新搜索未找到目标知识库编码: {expected_config.get('code')}"
         )
-    mismatches = compare_knowledge_configs(expected_config, existing["editConfig"])
+    verification_config = json.loads(json.dumps(expected_config, ensure_ascii=False))
+    requested_knowledge_class = _edit_field_text(expected_config.get("knowledge_class"))
+    selected_knowledge_class = _compact_text(actual_knowledge_class)
+    fallback_used = bool(
+        selected_knowledge_class
+        and _compact_text(selected_knowledge_class) != _compact_text(requested_knowledge_class)
+    )
+    if selected_knowledge_class:
+        # 创建表单可能只能显示兜底分类的文本，详情页返回的 value/text
+        # 也可能与源库的历史值不同；复核应以本次实际选择为准。
+        verification_config["knowledge_class"] = {
+            "value": selected_knowledge_class,
+            "text": selected_knowledge_class,
+        }
+    mismatches = compare_knowledge_configs(verification_config, existing["editConfig"])
     result = {
         "status": "verified" if not mismatches else "verification_failed",
         "knowledgeId": existing["knowledgeId"],
         "targetCode": expected_config.get("code"),
+        "requestedKnowledgeClass": requested_knowledge_class or None,
+        "actualKnowledgeClass": selected_knowledge_class or None,
+        "fallbackUsed": fallback_used,
         "mismatches": mismatches,
         "actualEditConfig": existing["editConfig"],
     }
@@ -1779,7 +1819,14 @@ def verify_created_knowledge(
         raise KnowledgeCreationUnavailable(
             "创建后字段复核不一致: " + ", ".join(mismatches)
         )
-    logger.info("创建后知识库字段复核成功: code=%s, knowledgeId=%s", expected_config.get("code") or "-", existing["knowledgeId"])
+    logger.info(
+        "创建后知识库字段复核成功: code=%s, knowledgeId=%s, requestedKnowledgeClass=%s, actualKnowledgeClass=%s, fallbackUsed=%s",
+        expected_config.get("code") or "-",
+        existing["knowledgeId"],
+        requested_knowledge_class or "未设置",
+        selected_knowledge_class or "未返回",
+        fallback_used,
+    )
     return result
 
 
@@ -1827,12 +1874,13 @@ def create_bge_knowledge_base(
             BGE_VECTOR_MODEL,
         )
         _set_visual_model(drawer, bool(expected_config.get("use_visual_model")))
-        _select_drawer_option(
+        selected_knowledge_class = _select_drawer_option(
             drawer,
             page,
             "hr-form-item__knowledgeClassId",
             "分类",
             _edit_field_text(expected_config["knowledge_class"]),
+            fallback_value="智能导诊",
         )
         logger.info("_bge 创建表单字段已填充，开始检查确认按钮: targetCode=%s", target_code)
 
@@ -1855,7 +1903,7 @@ def create_bge_knowledge_base(
         raise KnowledgeCreationUnavailable(f"创建表单操作失败: {exc}") from exc
 
     logger.info("知识库创建请求已提交: name=%s, code=%s", expected_config["name"], target_code)
-    return verify_created_knowledge(page, expected_config)
+    return verify_created_knowledge(page, expected_config, selected_knowledge_class)
 
 
 def save_knowledge_snapshot(
@@ -1950,6 +1998,263 @@ def save_knowledge_snapshot(
     return snapshot_path
 
 
+def get_knowledge_snapshot_path(
+    output_root: Path,
+    hospital_name: str,
+    knowledge_name: str,
+) -> Path:
+    return (
+        output_root
+        / safe_name(hospital_name, "未命名医院")
+        / safe_name(knowledge_name, "未命名知识库")
+        / "_metadata"
+        / "knowledge_snapshot.json"
+    )
+
+
+def load_knowledge_snapshot(
+    output_root: Path,
+    hospital_name: str,
+    knowledge_name: str,
+) -> tuple[Path, dict[str, Any]]:
+    snapshot_path = get_knowledge_snapshot_path(output_root, hospital_name, knowledge_name)
+    if not snapshot_path.exists():
+        raise KnowledgeConfigurationUnavailable(f"未找到已有知识库快照: {snapshot_path}")
+    try:
+        with snapshot_path.open("r", encoding="utf-8") as snapshot_file:
+            snapshot = json.load(snapshot_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise KnowledgeConfigurationUnavailable(f"读取知识库快照失败: {snapshot_path}: {exc}") from exc
+    if not isinstance(snapshot, dict):
+        raise KnowledgeConfigurationUnavailable(f"知识库快照格式无效: {snapshot_path}")
+    edit_config = snapshot.get("editConfig")
+    if not isinstance(edit_config, dict) or not str(edit_config.get("code") or "").strip():
+        raise KnowledgeConfigurationUnavailable(f"知识库快照缺少有效 editConfig/code: {snapshot_path}")
+    return snapshot_path, snapshot
+
+
+def update_bge_snapshot(
+    snapshot_path: Path,
+    bge_creation: dict[str, Any] | None = None,
+    bge_upload: dict[str, Any] | None = None,
+) -> None:
+    try:
+        with snapshot_path.open("r", encoding="utf-8") as snapshot_file:
+            snapshot = json.load(snapshot_file)
+        if not isinstance(snapshot, dict):
+            raise ValueError("快照根节点不是对象")
+        if bge_creation is not None:
+            snapshot["bgeCreation"] = redact_sensitive(bge_creation)
+        if bge_upload is not None:
+            snapshot["bgeUpload"] = redact_sensitive(bge_upload)
+        with snapshot_path.open("w", encoding="utf-8") as snapshot_file:
+            json.dump(snapshot, snapshot_file, ensure_ascii=False, indent=2)
+            snapshot_file.write("\n")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        logger.exception("_bge 后处理快照更新失败: path=%s", snapshot_path)
+        raise
+    logger.info(
+        "_bge 后处理快照已更新: path=%s, creation=%s, upload=%s",
+        snapshot_path,
+        bge_creation.get("status") if bge_creation else "未更新",
+        bge_upload.get("status") if bge_upload else "未更新",
+    )
+
+
+def run_bge_only(
+    page: Page,
+    token: str,
+    output_root: Path,
+    hospital_name: str,
+    knowledge_names: list[str],
+    create_bge_enabled: bool,
+    upload_bge_enabled: bool,
+) -> None:
+    """复用已有快照和本地 Excel，仅执行 _bge 创建、上传和状态轮询。"""
+    logger.info("进入仅后处理模式：跳过源知识条目读取和 Excel 导出")
+    pending_uploads: list[dict[str, Any]] = []
+    summary: list[tuple[str, str, str, str]] = []
+    processed_count = 0
+
+    for knowledge_name in knowledge_names:
+        logger.info("开始仅后处理知识库: %s", knowledge_name)
+        try:
+            snapshot_path, snapshot = load_knowledge_snapshot(
+                output_root,
+                hospital_name,
+                knowledge_name,
+            )
+        except KnowledgeConfigurationUnavailable as exc:
+            logger.warning("跳过仅后处理知识库: %s", exc)
+            summary.append((knowledge_name, "快照不可用", "未执行", "未执行"))
+            continue
+
+        edit_config = snapshot["editConfig"]
+        vector_model = str(snapshot.get("vectorModel") or edit_config.get("vector_model") or "").strip()
+        target_code = target_knowledge_code(edit_config)
+        local_files = list_local_xlsx_files(output_root, hospital_name, knowledge_name)
+        if vector_model.casefold() != TARGET_VECTOR_MODEL.casefold():
+            bge_creation = {
+                "status": "skipped_vector_model",
+                "targetCode": target_code,
+                "sourceVectorModel": vector_model,
+                "targetVectorModel": BGE_VECTOR_MODEL,
+            }
+            bge_upload = {
+                "status": "skipped_vector_model",
+                "targetCode": target_code,
+                "files": [],
+            }
+            update_bge_snapshot(snapshot_path, bge_creation, bge_upload)
+            summary.append((knowledge_name, "跳过", bge_creation["status"], bge_upload["status"]))
+            continue
+
+        if not local_files:
+            bge_creation = {
+                "status": "skipped_no_local_files",
+                "targetCode": target_code,
+                "reason": "没有可供后处理的本地 Excel",
+            }
+            bge_upload = {
+                "status": "skipped_no_local_files",
+                "targetCode": target_code,
+                "files": [],
+            }
+            update_bge_snapshot(snapshot_path, bge_creation, bge_upload)
+            logger.warning("跳过仅后处理知识库: 没有本地 Excel: %s", knowledge_name)
+            summary.append((knowledge_name, "跳过", bge_creation["status"], bge_upload["status"]))
+            continue
+
+        processed_count += 1
+        if not create_bge_enabled:
+            bge_creation = {
+                "status": "disabled",
+                "targetCode": target_code,
+                "reason": "创建开关未开启",
+            }
+            logger.info("未创建 _bge 知识库: 创建开关未开启")
+        else:
+            try:
+                bge_creation = create_bge_knowledge_base(page, edit_config)
+            except KnowledgeCreationUnavailable as exc:
+                bge_creation = {
+                    "status": "failed",
+                    "targetCode": target_code,
+                    "reason": str(exc),
+                }
+                logger.error("仅后处理创建 _bge 失败，继续处理后续知识库: %s", exc)
+
+        bge_upload: dict[str, Any] | None = None
+        if upload_bge_enabled:
+            try:
+                bge_upload = upload_bge_knowledge_base_files(
+                    page,
+                    token,
+                    output_root,
+                    hospital_name,
+                    knowledge_name,
+                    edit_config,
+                    bge_creation,
+                )
+                logger.info(
+                    "仅后处理上传准备完成: knowledge=%s, status=%s, files=%s",
+                    knowledge_name,
+                    bge_upload.get("status"),
+                    len(bge_upload.get("files", [])),
+                )
+            except (KnowledgeUploadUnavailable, requests.RequestException) as exc:
+                bge_upload = {
+                    "status": "skipped_target_unavailable",
+                    "targetCode": target_code,
+                    "files": [],
+                    "error": str(exc),
+                }
+                logger.error("跳过仅后处理上传: knowledge=%s, error=%s", knowledge_name, exc)
+        else:
+            bge_upload = {
+                "status": "disabled",
+                "targetCode": target_code,
+                "files": [],
+                "reason": "上传开关未开启",
+            }
+
+        update_bge_snapshot(snapshot_path, bge_creation, bge_upload)
+        if any(
+            item.get("status") in {"accepted", "waiting_existing", "processing"}
+            for item in bge_upload.get("files", [])
+        ):
+            pending_uploads.append(
+                {
+                    "targetKnowledgeId": bge_upload.get("targetKnowledgeId"),
+                    "bgeUpload": bge_upload,
+                    "snapshotPath": snapshot_path,
+                    "knowledgeName": knowledge_name,
+                    "bgeCreation": bge_creation,
+                }
+            )
+        summary.append(
+            (
+                knowledge_name,
+                "完成",
+                bge_creation.get("status", "未知"),
+                bge_upload.get("status", "未知"),
+            )
+        )
+
+    if pending_uploads:
+        try:
+            upload_status_map = fetch_progress_status_map(token)
+        except requests.RequestException as exc:
+            upload_status_map = {}
+            logger.warning("仅后处理统一轮询前读取状态字典失败，将使用文件记录中的状态: %s", exc)
+
+        logger.info("开始统一轮询仅后处理上传文件状态: %s 个知识库", len(pending_uploads))
+        for job in pending_uploads:
+            target_id = str(job.get("targetKnowledgeId") or "").strip()
+            if not target_id:
+                logger.warning("跳过状态轮询：上传结果缺少 targetKnowledgeId: %s", job["knowledgeName"])
+                continue
+            final_files = poll_bge_uploads(
+                target_id,
+                token,
+                job["bgeUpload"].get("files", []),
+                upload_status_map,
+            )
+            job["bgeUpload"]["files"] = final_files
+            job["bgeUpload"]["status"] = _aggregate_bge_upload_status(final_files)
+            update_bge_snapshot(
+                job["snapshotPath"],
+                job["bgeCreation"],
+                job["bgeUpload"],
+            )
+            logger.info(
+                "仅后处理上传状态轮询完成: knowledge=%s, status=%s",
+                job["knowledgeName"],
+                job["bgeUpload"]["status"],
+            )
+            for index, item in enumerate(summary):
+                if item[0] == job["knowledgeName"]:
+                    summary[index] = (
+                        item[0],
+                        item[1],
+                        item[2],
+                        job["bgeUpload"]["status"],
+                    )
+                    break
+
+    if processed_count == 0:
+        logger.warning("仅后处理没有找到包含本地 Excel 的可处理知识库")
+    logger.info("仅后处理运行汇总:")
+    for knowledge_name, status, creation_status, upload_status in summary:
+        logger.info(
+            "- %s: %s；_bge 创建=%s；_bge 上传=%s",
+            knowledge_name,
+            status,
+            creation_status,
+            upload_status,
+        )
+
+
 def safe_name(value: str, fallback: str) -> str:
     """生成 Windows 可用的目录名或文件名，避免接口返回非法字符。"""
     value = (value or fallback).strip()
@@ -2034,6 +2339,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="将本地 Excel 上传到已存在的 _bge 知识库并轮询导入状态；默认关闭",
     )
+    stage_group = parser.add_mutually_exclusive_group()
+    stage_group.add_argument(
+        "--export-only",
+        action="store_true",
+        help="仅执行源知识库读取和 Excel 导出，跳过 _bge 创建与上传",
+    )
+    stage_group.add_argument(
+        "--create-only",
+        action="store_true",
+        help="跳过导出，仅复用已有快照和本地 Excel 创建 _bge 知识库，不上传文件",
+    )
+    stage_group.add_argument(
+        "--upload-only",
+        action="store_true",
+        help="跳过导出和创建，仅使用已有快照及 Excel 上传文件并轮询导入状态",
+    )
+    stage_group.add_argument(
+        "--bge-only",
+        action="store_true",
+        help="跳过源知识库导出，复用已有快照和本地 Excel；创建和上传仍由配置或对应开关控制",
+    )
     return parser.parse_args()
 
 
@@ -2083,8 +2409,25 @@ def main() -> int:
     config = load_config(config_path)
     username, password = get_credentials(args, config)
     knowledge_names = get_knowledge_names(args, config)
-    create_bge_enabled = is_create_bge_enabled(args, config)
-    upload_bge_enabled = is_upload_bge_enabled(args, config)
+    if args.export_only:
+        create_bge_enabled = False
+        upload_bge_enabled = False
+        run_postprocessing_only = False
+        logger.info("运行模式: 仅导出，忽略 _bge 创建和上传开关")
+    elif args.create_only:
+        create_bge_enabled = True
+        upload_bge_enabled = False
+        run_postprocessing_only = True
+        logger.info("运行模式: 仅创建 _bge，跳过导出和文件上传")
+    elif args.upload_only:
+        create_bge_enabled = False
+        upload_bge_enabled = True
+        run_postprocessing_only = True
+        logger.info("运行模式: 仅上传文件，跳过导出和 _bge 创建")
+    else:
+        create_bge_enabled = is_create_bge_enabled(args, config)
+        upload_bge_enabled = is_upload_bge_enabled(args, config)
+        run_postprocessing_only = args.bge_only
     hospital_name = str(config_value(config, "hospitalName", "hospital_name", default="demo"))
     output_root_value = config_value(config, "outputRoot", "output_root")
     output_root = Path(output_root_value).expanduser() if output_root_value else DEFAULT_OUTPUT_ROOT
@@ -2123,6 +2466,21 @@ def main() -> int:
         try:
             login(page, username, password)
             logger.info("登录流程完成，开始处理知识库列表: count=%s", len(knowledge_names))
+            if run_postprocessing_only:
+                token = token_holder.get("value")
+                if not token:
+                    fail("登录成功但未捕获到页面请求中的 user-token，无法执行 _bge 后处理")
+                run_bge_only(
+                    page,
+                    token,
+                    output_root,
+                    hospital_name,
+                    knowledge_names,
+                    create_bge_enabled,
+                    upload_bge_enabled,
+                )
+                logger.info("仅后处理运行结束，日志文件: %s", log_path)
+                return 0
             total_exported = 0
             summary: list[tuple[str, str, int, int, int]] = []
             pending_uploads: list[dict[str, Any]] = []

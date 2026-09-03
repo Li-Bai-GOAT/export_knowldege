@@ -90,6 +90,66 @@ Copy-Item .\config.example.json .\config.json
 
 ## 推荐启动方式：自动批量导出
 
+### 一键启动一个医院（一个账号）
+
+项目根目录新增了 Windows 一键入口：
+
+```text
+start_hospital_full.cmd
+```
+
+双击该文件，或在 PowerShell 中执行：
+
+```powershell
+cd C:\Users\ASUS\Desktop\export_knowldege
+.\start_hospital.ps1
+```
+
+它会自动完成：检查 `.venv` 和 `config.json`、检查 Python 依赖、启动 `knowledge_query.py`、登录一个账号、处理配置中的全部知识库、导出 Excel、保存日志和快照。
+
+默认是否创建和上传 `_bge`，由 `config.json` 中的两个开关控制：
+
+```json
+"createBgeKnowledgeBases": false,
+"uploadBgeKnowledgeBases": false
+```
+
+确认线上目标库和本地文件后，可以临时开启完整写入流程：
+
+```powershell
+.\start_hospital.ps1 -CreateBge -UploadBge -PauseOnExit
+```
+
+三个环节也可以分别启动：
+
+```powershell
+# 第一步：只读取源知识库并导出 Excel
+.\start_hospital.ps1 -ExportOnly
+
+# 第二步：只根据已有快照和 Excel 创建 _bge 知识库
+.\start_hospital.ps1 -CreateOnly
+
+# 第三步：只把已有 Excel 上传到已经存在的 _bge 知识库，并轮询导入状态
+.\start_hospital.ps1 -UploadOnly
+```
+
+`-CreateOnly` 和 `-UploadOnly` 都会跳过源知识库读取及 Excel 导出，复用：
+
+```text
+output/<医院名称>/<知识库名称>/_metadata/knowledge_snapshot.json
+output/<医院名称>/<知识库名称>/*.xlsx
+```
+
+因此，单独执行 `-UploadOnly` 前，需要先成功完成过导出，并确认目标 `_bge` 知识库已经存在；该模式不会创建目标库，也不会重新导出或覆盖本地 Excel。
+
+无界面运行：
+
+```powershell
+.\start_hospital.ps1 -Headless
+```
+
+该一键脚本只适用于“一个 `config.json` 对应一个医院账号”的任务；切换医院时替换或通过 `-ConfigPath` 指定另一份配置文件。
+
 确保当前目录是脚本目录：
 
 ```powershell
@@ -124,6 +184,12 @@ python .\knowledge_query.py
 
 ```powershell
 python .\knowledge_query.py --create-bge
+```
+
+如果只执行创建阶段（不重新导出、不上传文件），使用：
+
+```powershell
+python .\knowledge_query.py --create-only
 ```
 
 也可以在 `config.json` 中设置：
@@ -163,6 +229,14 @@ output/<医院名称>/<知识库名称>/*.xlsx
 每个 Excel 单独上传，目标库中已存在同名文件会跳过；接口没有返回进度 ID 时，会通过上传前后文件列表对账，无法唯一关联时记录 `uploaded_untracked`，不会盲目重传。全部上传请求完成后，脚本按 2 秒、5 秒、15 秒递增间隔轮询文件状态，单个文件最多等待 5 分钟；最终状态会记录为 `import_success`、`import_failed`、`timeout`、`skipped_existing`、`upload_rejected` 或 `uploaded_untracked`。结果写入对应源知识库的 `_metadata\knowledge_snapshot.json` 的 `bgeUpload` 字段。
 
 `--upload-bge` 会向第三方线上系统传输本地 Excel。正式运行前请先确认目标知识库和本地文件清单；默认配置保持关闭。
+
+如果只执行上传阶段，使用：
+
+```powershell
+python .\knowledge_query.py --upload-only
+```
+
+`--upload-only` 会强制关闭 `_bge` 创建，只扫描已有快照和 Excel，上传到已存在的目标库，然后继续轮询并记录最终导入状态。
 
 ### 运行日志
 
