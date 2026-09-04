@@ -70,6 +70,7 @@ UPLOAD_URL = "https://aicloud.eheren.com/ai-manager/knowledge/uploadKnowledgeFil
 PROC_STATUS_URL = "https://aicloud.eheren.com/ai-manager/commonData/queryKnowledgeProcStatus"
 PROGRESS_PAGE_SIZE = 10
 UPLOAD_POLL_TIMEOUT_SECONDS = 5 * 60
+DROPDOWN_ACTION_TIMEOUT_MS = 2_500
 IMPORT_SUCCESS_STATUS_CODES = {"2"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
@@ -1475,25 +1476,67 @@ def _control_label(control: Any) -> str:
         return ""
 
 
-def _click_visible_exact(page: Page, text: str) -> None:
-    """点击当前可见下拉选项，避免误点页面中同名的静态文本。"""
-    candidates = [
-        page.get_by_role("option", name=text, exact=True),
-        page.locator(".hr-select-dropdown__item, .hr-select-option, .hr-dropdown__item-text").filter(
-            has_text=text
-        ),
-        page.get_by_text(text, exact=True),
-    ]
-    for candidate in candidates:
-        for index in range(candidate.count()):
-            option = candidate.nth(index)
+def _click_visible_exact(
+    page: Page,
+    text: str,
+    timeout_ms: int = DROPDOWN_ACTION_TIMEOUT_MS,
+) -> None:
+    """只在当前可见的下拉浮层内点击精确匹配项，并限制总等待时间。"""
+    expected_text = _compact_text(text)
+    deadline = time.monotonic() + timeout_ms / 1_000
+    dropdowns = page.locator(
+        "[role='listbox'], .hr-select-dropdown, .hr-select__dropdown, .hr-select__popper, "
+        ".hr-popper, .hr-dropdown-menu"
+    )
+    option_selector = (
+        "[role='option'], .hr-select-dropdown__item, .hr-select-option, "
+        ".hr-dropdown__item-text, .hr-dropdown-menu__item"
+    )
+
+    while time.monotonic() < deadline:
+        for dropdown_index in range(dropdowns.count()):
+            dropdown = dropdowns.nth(dropdown_index)
             try:
-                if option.is_visible():
-                    option.click()
-                    return
+                if not dropdown.is_visible():
+                    continue
             except Exception:
                 continue
-    raise KnowledgeCreationUnavailable(f"下拉选项不存在或不可见: {text}")
+
+            options = dropdown.locator(option_selector)
+            for option_index in range(options.count()):
+                option = options.nth(option_index)
+                try:
+                    if not option.is_visible():
+                        continue
+                    matches = option.evaluate(
+                        r"""(el, expected) => {
+                            const compact = value => String(value || '').replace(/\s+/g, '');
+                            if (compact(el.innerText || el.textContent) === expected) return true;
+                            return Array.from(el.querySelectorAll('*')).some(child => {
+                                const style = getComputedStyle(child);
+                                const rect = child.getBoundingClientRect();
+                                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                                    Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0 &&
+                                    compact(child.innerText || child.textContent) === expected;
+                            });
+                        }""",
+                        expected_text,
+                    )
+                    if not matches:
+                        continue
+                    remaining_ms = max(100, int((deadline - time.monotonic()) * 1_000))
+                    option.click(timeout=remaining_ms)
+                    return
+                except Exception:
+                    continue
+
+        remaining_ms = int((deadline - time.monotonic()) * 1_000)
+        if remaining_ms > 0:
+            page.wait_for_timeout(min(100, remaining_ms))
+
+    raise KnowledgeCreationUnavailable(
+        f"下拉选项不存在或不可见（等待 {timeout_ms}ms）: {text}"
+    )
 
 
 def _select_drawer_option(
@@ -1507,24 +1550,35 @@ def _select_drawer_option(
     field = _drawer_field(drawer, class_name, label)
     control = field.locator('input:not([type="radio"]):not([type="checkbox"])').first
     if control.count() > 0:
-        control.click()
+        control.click(timeout=DROPDOWN_ACTION_TIMEOUT_MS)
     else:
-        field.click()
+        field.click(timeout=DROPDOWN_ACTION_TIMEOUT_MS)
     selected_value = value
-    try:
-        _click_visible_exact(page, value)
-    except KnowledgeCreationUnavailable as exc:
-        if not fallback_value:
-            raise
+    requested_value = _compact_text(value)
+    if fallback_value and requested_value.isdecimal():
         logger.warning(
-            "创建表单下拉选项不可用，使用兜底选项: field=%s, requested=%s, fallback=%s, reason=%s",
+            "创建表单分类值为纯数字，跳过原值并直接使用兜底选项: field=%s, requested=%s, fallback=%s",
             label,
             value or "未设置",
             fallback_value,
-            exc,
         )
         _click_visible_exact(page, fallback_value)
         selected_value = fallback_value
+    else:
+        try:
+            _click_visible_exact(page, value)
+        except KnowledgeCreationUnavailable as exc:
+            if not fallback_value:
+                raise
+            logger.warning(
+                "创建表单下拉选项不可用，使用兜底选项: field=%s, requested=%s, fallback=%s, reason=%s",
+                label,
+                value or "未设置",
+                fallback_value,
+                exc,
+            )
+            _click_visible_exact(page, fallback_value)
+            selected_value = fallback_value
     actual_values: set[str] = set()
     try:
         if control.count() > 0:
